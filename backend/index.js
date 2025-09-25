@@ -37,6 +37,8 @@ const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
 const cloudinary = require('cloudinary').v2;
 
+
+
 // =================================================================
 // 3. إعداد تطبيق Express والخادم
 // =================================================================
@@ -60,7 +62,7 @@ app.options('*', cors({
 const oauth2Client = new OAuth2Client(
     process.env.GOOGLE_CLIENT_ID,
     process.env.GOOGLE_CLIENT_SECRET,
-    "https://chatzeus-production.up.railway.app/auth/google/callback"
+    "https://chatzeusb.vercel.app/auth/google/callback"
   );
 
 app.use(express.json({ limit: '50mb' }));
@@ -76,16 +78,32 @@ cloudinary.config({
 console.log('✅ Cloudinary configured.');
 
 // =================================================================
-// 4. Middleware للتحقق من التوكن
+// 4. Middleware للتحقق من التوكن (يدعم كلا من JWT والتوكن الثابت للوحة التحكم)
 // =================================================================
 function verifyToken(req, res, next) {
     const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1]; // استخراج التوكن من 'Bearer TOKEN'
+    const token = authHeader && authHeader.split(' ')[1];
 
-    if (token == null) {
+    if (!token) {
         return res.status(401).json({ loggedIn: false, message: 'No token provided.' });
     }
 
+    // ✨ التوكن الثابت للوحة التحكم (للاختبار فقط) ✨
+    const DASHBOARD_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjY4ZDMyNWYxMDBlNDQzMjQ1ZmUwOWU4ZCIsImdvb2dsZUlkIjoiMTA1OTIzOTczMjEwNTE4ODM5NjU5IiwibmFtZSI6Iti52KjZiCDYr9mKJyIsImVtYWlsIjoiZmxhZi5hYm9vZGVnZ2dAZ21haWwuY29tIiwicGljdHVyZSI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0ozUXFSYS1ZM0E1dFBDWGg0ZFhmZVpmNmdIUlJ0dW1qT0oxZ2pvTEhjMDR0VFFqUT1zOTYtYyIsImlhdCI6MTc1ODcyNzEyOSwiZXhwIjoxNzU5MzMxOTI5fQ.VnYebbJWY2ukAa9fpcFMLdEcdQsZd4TFks7i7s6MNWU';
+
+    // إذا كان التوكن يطابق توكن لوحة التحكم
+    if (token === DASHBOARD_TOKEN) {
+        // فك تشفير التوكن لاستخراج بيانات المستخدم
+        try {
+            const decoded = jwt.decode(token);
+            req.user = decoded;
+            return next();
+        } catch (error) {
+            return res.status(403).json({ loggedIn: false, message: 'Invalid dashboard token format.' });
+        }
+    }
+
+    // التحقق من JWT العادي
     jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
         if (err) {
             return res.status(403).json({ loggedIn: false, message: 'Token is not valid.' });
@@ -603,14 +621,86 @@ app.delete('/api/chats/:chatId', verifyToken, async (req, res) => {
     }
 });
 
-// =================================================================
-// 5. عرض الملفات الثابتة
-// =================================================================
-app.use(express.static(path.join(__dirname, '..', 'frontend')));
 
-// مسار للصفحة الرئيسية فقط (بدلاً من * التي تسبب تضارب)
-app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, '..', 'frontend', 'index.html'));
+// =================================================================
+// ✨ 6. مسارات لوحة التحكم (Dashboard Routes) ✨
+// =================================================================
+app.get('/api/dashboard/stats', verifyToken, async (req, res) => {
+    try {
+        console.log('🔍 Dashboard stats request received');
+        
+        // ✨ جلب إجمالي المستخدمين
+        const totalUsers = await User.countDocuments();
+
+        // ✨ جلب إجمالي المحادثات
+        const totalChats = await Chat.countDocuments();
+
+        // ✨ جلب إجمالي الرسائل
+        const totalMessagesResult = await Chat.aggregate([
+            { $unwind: '$messages' },
+            { $count: 'total' }
+        ]);
+        const totalMessages = totalMessagesResult.length > 0 ? totalMessagesResult[0].total : 0;
+
+        // ✨ جلب إجمالي الملفات المرفوعة (تحديث الاستعلام)
+        const totalUploadsResult = await Chat.aggregate([
+            { $unwind: '$messages' },
+            { $match: { 
+                $or: [
+                    { 'messages.attachments': { $exists: true, $not: { $size: 0 } } },
+                    { 'messages.fileUrl': { $exists: true, $ne: null } }
+                ]
+            }},
+            { $count: 'total' }
+        ]);
+        const totalUploads = totalUploadsResult.length > 0 ? totalUploadsResult[0].total : 0;
+
+        // ✨ إحصائيات المستخدمين الجدد (آخر 30 يوم)
+        const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+        const newUsersByDate = await User.aggregate([
+            { $match: { createdAt: { $gte: thirtyDaysAgo } } },
+            {
+                $group: {
+                    _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+                    count: { $sum: 1 }
+                }
+            },
+            { $sort: { _id: 1 } }
+        ]);
+        
+        const usersByDate = {
+            labels: newUsersByDate.map(item => item._id),
+            data: newUsersByDate.map(item => item.count)
+        };
+
+        // ✨ إحصائيات المحادثات حسب المزود
+        const chatsByProviderResult = await Chat.aggregate([
+            { $group: { _id: '$provider', count: { $sum: 1 } } }
+        ]);
+        const chatsByProvider = {
+            labels: chatsByProviderResult.map(item => item._id || 'غير معروف'),
+            data: chatsByProviderResult.map(item => item.count)
+        };
+        
+        const responseData = {
+            totalUsers,
+            totalChats,
+            totalMessages,
+            totalUploads,
+            usersByDate,
+            chatsByProvider
+        };
+        
+        console.log('✅ Dashboard stats response:', responseData);
+        res.status(200).json(responseData);
+        
+    } catch (error) {
+        console.error('❌ Error fetching dashboard stats:', error);
+        res.status(500).json({ 
+            message: 'Failed to fetch dashboard statistics', 
+            error: error.message 
+        });
+    }
 });
 
 
@@ -1216,7 +1306,5 @@ mongoose.connect(process.env.MONGODB_URI)
 // =================================================================
 // 7. تشغيل الخادم
 // =================================================================
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`✅ Zeus Pro Server (Manual Env) is now running on http://0.0.0.0:${PORT}` );
-});
+// ✅ أضف هذا السطر في نهاية الملف
+module.exports = app;
